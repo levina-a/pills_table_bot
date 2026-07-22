@@ -204,10 +204,12 @@ async def render_day(target: Message | CallbackQuery, user_id: int, selected: da
                 buttons.append(dose_buttons)
     else:
         text = title + "\n\nНа этот день активных препаратов пока нет."
-    buttons += [
-        [InlineKeyboardButton(text="📅 Выбрать другую дату", callback_data=f"calendar:{selected.isoformat()}")],
-        [InlineKeyboardButton(text="← Меню", callback_data="menu")],
-    ]
+    buttons.append([
+        InlineKeyboardButton(
+            text="← Назад в календарь",
+            callback_data=f"calendar:{selected.isoformat()}",
+        )
+    ])
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=markup)
