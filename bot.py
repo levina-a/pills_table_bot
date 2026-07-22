@@ -299,7 +299,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu")
 async def show_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text("Что хотите сделать?", reply_markup=menu())
+    await callback.message.edit_text("\u2063", reply_markup=menu())
     await callback.answer()
 
 
