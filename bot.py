@@ -4,6 +4,7 @@ import asyncio
 import calendar
 import contextlib
 import html
+import logging
 import os
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -25,6 +26,11 @@ DB_PATH = os.getenv("DATABASE_PATH", "pills.db")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 MAX_ACTIVE_MEDICINES = 20
 MAX_NOTE_LENGTH = 200
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("pills_bot")
 router = Router()
 
 MONTHS = (
@@ -141,6 +147,7 @@ async def init_db() -> None:
             )
             await db.execute("INSERT INTO app_meta VALUES ('dose_log_migrated', '1')")
         await db.commit()
+    logger.info("Database initialized: %s", DB_PATH)
 
 
 def menu() -> InlineKeyboardMarkup:
@@ -248,6 +255,11 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
             )
         except Exception:
+            logger.exception(
+                "Failed to send reminder group: time=%s, medicines=%d",
+                scheduled_time,
+                len(reminders),
+            )
             continue
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executemany(
@@ -265,12 +277,23 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
             )
             await db.commit()
         sent += len(reminders)
+        logger.info(
+            "Reminder group sent: time=%s, medicines=%d",
+            scheduled_time,
+            len(reminders),
+        )
     return sent
 
 
 async def reminder_loop(bot: Bot) -> None:
+    logger.info("Reminder scheduler started")
     while True:
-        await send_due_reminders(bot)
+        try:
+            await send_due_reminders(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Reminder scheduler iteration failed")
         await asyncio.sleep(30)
 
 
@@ -1215,10 +1238,12 @@ async def main() -> None:
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(router)
+    logger.info("Starting Telegram bot polling")
     reminders = asyncio.create_task(reminder_loop(bot))
     try:
         await dispatcher.start_polling(bot)
     finally:
+        logger.info("Stopping Telegram bot")
         reminders.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reminders
