@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import contextlib
 import html
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -88,6 +89,14 @@ async def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                user_id INTEGER NOT NULL,
+                medicine_id INTEGER NOT NULL REFERENCES medicines(id) ON DELETE CASCADE,
+                reminder_date TEXT NOT NULL,
+                dose_number INTEGER NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, medicine_id, reminder_date, dose_number)
+            );
             """
         )
         columns = {row[1] for row in await (await db.execute("PRAGMA table_info(medicines)")).fetchall()}
@@ -163,6 +172,82 @@ async def day_data(user_id: int, iso_day: str) -> list[tuple]:
     ]
 
 
+async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
+    current = now or datetime.now(TIMEZONE)
+    current_time = current.time().replace(tzinfo=None)
+    if current_time >= time(23, 0):
+        due_slots = ((2, 2), (3, 3))
+    elif current_time >= time(17, 0):
+        due_slots = ((2, 1), (3, 2))
+    elif current_time >= time(11, 0):
+        due_slots = ((2, 1), (3, 1))
+    else:
+        return 0
+
+    iso_day = current.date().isoformat()
+    sent = 0
+    for frequency, dose_number in due_slots:
+        async with aiosqlite.connect(DB_PATH) as db:
+            rows = await (await db.execute(
+                """
+                SELECT m.id, m.user_id, m.name
+                FROM medicines m
+                LEFT JOIN dose_log d ON d.medicine_id = m.id
+                    AND d.user_id = m.user_id
+                    AND d.intake_date = ?
+                    AND d.dose_number = ?
+                LEFT JOIN reminder_log r ON r.medicine_id = m.id
+                    AND r.user_id = m.user_id
+                    AND r.reminder_date = ?
+                    AND r.dose_number = ?
+                WHERE m.active = 1
+                  AND m.frequency = ?
+                  AND (m.start_date IS NULL OR m.start_date <= ?)
+                  AND (m.end_date IS NULL OR m.end_date >= ?)
+                  AND d.medicine_id IS NULL
+                  AND r.medicine_id IS NULL
+                """,
+                (
+                    iso_day, dose_number, iso_day, dose_number,
+                    frequency, iso_day, iso_day,
+                ),
+            )).fetchall()
+
+        for medicine_id, user_id, name in rows:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Принято",
+                    callback_data=f"remtaken:{medicine_id}:{dose_number}:{iso_day}",
+                ),
+                InlineKeyboardButton(
+                    text="⏳ Ещё нет",
+                    callback_data=f"remlater:{medicine_id}:{dose_number}:{iso_day}",
+                ),
+            ]])
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"💊 <b>{html.escape(name)}</b> — приём {dose_number} из {frequency}\n\nУже приняли?",
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                continue
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO reminder_log VALUES (?, ?, ?, ?, ?)",
+                    (user_id, medicine_id, iso_day, dose_number, current.isoformat()),
+                )
+                await db.commit()
+            sent += 1
+    return sent
+
+
+async def reminder_loop(bot: Bot) -> None:
+    while True:
+        await send_due_reminders(bot)
+        await asyncio.sleep(30)
+
+
 async def render_day(
     target: Message | CallbackQuery,
     user_id: int,
@@ -211,7 +296,7 @@ async def render_day(
     else:
         text = title + "\n\nНа этот день активных препаратов пока нет."
     if origin == "menu":
-        back_text = "← Назад в главное меню"
+        back_text = "← Меню"
         back_callback = "menu"
     else:
         back_text = "← Назад в календарь"
@@ -878,6 +963,72 @@ async def toggle_intake(callback: CallbackQuery) -> None:
     await render_day(callback, callback.from_user.id, date.fromisoformat(iso_day), origin)
 
 
+async def reminder_medicine(
+    user_id: int,
+    medicine_id: int,
+    dose_number: int,
+    iso_day: str,
+) -> tuple[str, int] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            """SELECT name, frequency FROM medicines
+               WHERE id = ? AND user_id = ? AND active = 1 AND frequency IN (2, 3)
+                 AND ? BETWEEN 1 AND frequency
+                 AND (start_date IS NULL OR start_date <= ?)
+                 AND (end_date IS NULL OR end_date >= ?)""",
+            (medicine_id, user_id, dose_number, iso_day, iso_day),
+        )).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+@router.callback_query(F.data.startswith("remtaken:"))
+async def reminder_taken(callback: CallbackQuery) -> None:
+    _, medicine_raw, dose_raw, iso_day = callback.data.split(":")
+    medicine_id = int(medicine_raw)
+    dose_number = int(dose_raw)
+    medicine = await reminder_medicine(
+        callback.from_user.id, medicine_id, dose_number, iso_day
+    )
+    if not medicine:
+        await callback.answer("Приём не найден", show_alert=True)
+        return
+    name, frequency = medicine
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO dose_log VALUES (?, ?, ?, ?, ?)",
+            (
+                callback.from_user.id,
+                medicine_id,
+                iso_day,
+                dose_number,
+                datetime.now(TIMEZONE).isoformat(),
+            ),
+        )
+        await db.commit()
+    await callback.message.edit_text(
+        f"✅ <b>{html.escape(name)}</b> — приём {dose_number} из {frequency} отмечен"
+    )
+    await callback.answer("Приём отмечен")
+
+
+@router.callback_query(F.data.startswith("remlater:"))
+async def reminder_not_yet(callback: CallbackQuery) -> None:
+    _, medicine_raw, dose_raw, iso_day = callback.data.split(":")
+    medicine_id = int(medicine_raw)
+    dose_number = int(dose_raw)
+    medicine = await reminder_medicine(
+        callback.from_user.id, medicine_id, dose_number, iso_day
+    )
+    if not medicine:
+        await callback.answer("Приём не найден", show_alert=True)
+        return
+    name, frequency = medicine
+    await callback.message.edit_text(
+        f"⏳ <b>{html.escape(name)}</b> — приём {dose_number} из {frequency} пока не отмечен"
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -891,7 +1042,13 @@ async def main() -> None:
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(router)
-    await dispatcher.start_polling(bot)
+    reminders = asyncio.create_task(reminder_loop(bot))
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        reminders.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reminders
 
 
 if __name__ == "__main__":
