@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 DB_PATH = os.getenv("DATABASE_PATH", "pills.db")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
+MAX_ACTIVE_MEDICINES = 20
 router = Router()
 
 MONTHS = (
@@ -162,7 +163,12 @@ async def day_data(user_id: int, iso_day: str) -> list[tuple]:
     ]
 
 
-async def render_day(target: Message | CallbackQuery, user_id: int, selected: date) -> None:
+async def render_day(
+    target: Message | CallbackQuery,
+    user_id: int,
+    selected: date,
+    origin: str = "calendar",
+) -> None:
     rows = await day_data(user_id, selected.isoformat())
     title = f"💊 Приёмы на {selected.strftime('%d.%m.%Y')}"
     buttons = []
@@ -188,7 +194,7 @@ async def render_day(target: Message | CallbackQuery, user_id: int, selected: da
             header_callback = "noop"
             if medicine["frequency"] == 1:
                 dose_number, _ = doses[0]
-                header_callback = f"toggle:{medicine_id}:{dose_number}:{selected.isoformat()}"
+                header_callback = f"toggle:{medicine_id}:{dose_number}:{selected.isoformat()}:{origin}"
             buttons.append([InlineKeyboardButton(
                 text=f"{status} 💊 {medicine['name']} · {medicine_completed}/{medicine['frequency']}",
                 callback_data=header_callback,
@@ -197,19 +203,20 @@ async def render_day(target: Message | CallbackQuery, user_id: int, selected: da
                 dose_buttons = [
                     InlineKeyboardButton(
                         text=f"{'✅' if taken else '○'} Приём {dose_number}",
-                        callback_data=f"toggle:{medicine_id}:{dose_number}:{selected.isoformat()}",
+                        callback_data=f"toggle:{medicine_id}:{dose_number}:{selected.isoformat()}:{origin}",
                     )
                     for dose_number, taken in doses
                 ]
                 buttons.append(dose_buttons)
     else:
         text = title + "\n\nНа этот день активных препаратов пока нет."
-    buttons.append([
-        InlineKeyboardButton(
-            text="← Назад в календарь",
-            callback_data=f"calendar:{selected.isoformat()}",
-        )
-    ])
+    if origin == "menu":
+        back_text = "← Назад в главное меню"
+        back_callback = "menu"
+    else:
+        back_text = "← Назад в календарь"
+        back_callback = f"calendar:{selected.isoformat()}"
+    buttons.append([InlineKeyboardButton(text=back_text, callback_data=back_callback)])
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=markup)
@@ -299,18 +306,37 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu")
 async def show_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text("\u2063", reply_markup=menu())
+    await callback.message.edit_text("Выберите действие", reply_markup=menu())
     await callback.answer()
 
 
 @router.callback_query(F.data == "medicine:add")
 async def add_medicine(callback: CallbackQuery, state: FSMContext) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        active_count = await (await db.execute(
+            "SELECT COUNT(*) FROM medicines WHERE user_id = ? AND active = 1",
+            (callback.from_user.id,),
+        )).fetchone()
+    if active_count[0] >= MAX_ACTIVE_MEDICINES:
+        await callback.answer(
+            f"Достигнут лимит в {MAX_ACTIVE_MEDICINES} препаратов. "
+            "Удалите один из них, чтобы добавить новый.",
+            show_alert=True,
+        )
+        return
     await state.clear()
     await state.set_state(AddMedicine.name)
     await callback.message.edit_text(
-        "<b>Шаг 1 из 5. Название</b>\n\nВведите название препарата. Для отмены: /cancel"
+        "<b>Шаг 1 из 5. Название</b>\n\nВведите название препарата.",
+        reply_markup=cancel_keyboard(),
     )
     await callback.answer()
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]
+    ])
 
 
 def course_dates(start_date: date, kind: str, amount: int | None = None) -> tuple[date | None, str]:
@@ -333,7 +359,7 @@ def duration_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="3 месяца", callback_data="duration:months:3")],
         [InlineKeyboardButton(text="Бессрочно", callback_data="duration:forever")],
         [InlineKeyboardButton(text="Другой срок", callback_data="duration:custom")],
-        [InlineKeyboardButton(text="← Отмена", callback_data="menu")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
 
 
@@ -342,7 +368,7 @@ async def ask_start_date(target: Message | CallbackQuery, state: FSMContext) -> 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Начать сегодня", callback_data="startdate:today")],
         [InlineKeyboardButton(text="Выбрать дату", callback_data="startdate:choose")],
-        [InlineKeyboardButton(text="← Отмена", callback_data="menu")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
     text = "<b>Шаг 3 из 5. Дата начала</b>\n\nКогда начался или начнётся курс?"
     if isinstance(target, CallbackQuery):
@@ -358,7 +384,8 @@ async def choose_duration(callback: CallbackQuery, state: FSMContext) -> None:
     if parts[1] == "custom":
         await state.set_state(AddMedicine.custom_duration)
         await callback.message.edit_text(
-            "<b>Шаг 2 из 5. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>"
+            "<b>Шаг 2 из 5. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>",
+            reply_markup=cancel_keyboard(),
         )
         await callback.answer()
         return
@@ -376,7 +403,7 @@ async def custom_duration(message: Message, state: FSMContext) -> None:
     except ValueError:
         days = 0
     if not 1 <= days <= 3650:
-        await message.answer("Введите число от 1 до 3650.")
+        await message.answer("Введите число от 1 до 3650.", reply_markup=cancel_keyboard())
         return
     await state.update_data(duration_kind="days", duration_amount=days, duration_label=f"{days} дн.")
     await ask_start_date(message, state)
@@ -386,7 +413,7 @@ async def custom_duration(message: Message, state: FSMContext) -> None:
 async def medicine_name(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not name or len(name) > 80:
-        await message.answer("Введите название длиной до 80 символов.")
+        await message.answer("Введите название длиной до 80 символов.", reply_markup=cancel_keyboard())
         return
     await state.update_data(name=name)
     await state.set_state(AddMedicine.duration)
@@ -409,7 +436,7 @@ async def save_start_date(target: CallbackQuery, state: FSMContext, selected: da
         [InlineKeyboardButton(text="1 раз в день", callback_data="frequency:1")],
         [InlineKeyboardButton(text="2 раза в день", callback_data="frequency:2")],
         [InlineKeyboardButton(text="3 раза в день", callback_data="frequency:3")],
-        [InlineKeyboardButton(text="← Отмена", callback_data="menu")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
     await target.message.edit_text(
         "<b>Шаг 4 из 5. Частота приёма</b>\n\nСколько раз в день нужно принимать препарат?",
@@ -438,7 +465,7 @@ async def choose_frequency(callback: CallbackQuery, state: FSMContext) -> None:
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сохранить", callback_data="medicine:save")],
-        [InlineKeyboardButton(text="← Отмена", callback_data="menu")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -462,7 +489,7 @@ def start_calendar_markup(year: int, month: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Сегодня", callback_data="startdate:today"),
         InlineKeyboardButton(text="›", callback_data=f"startcal:{following.isoformat()}"),
     ])
-    rows.append([InlineKeyboardButton(text="← Отмена", callback_data="menu")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -498,6 +525,19 @@ async def pick_start_date(callback: CallbackQuery, state: FSMContext) -> None:
 async def save_medicine(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     async with aiosqlite.connect(DB_PATH) as db:
+        active_count = await (await db.execute(
+            "SELECT COUNT(*) FROM medicines WHERE user_id = ? AND active = 1",
+            (callback.from_user.id,),
+        )).fetchone()
+        if active_count[0] >= MAX_ACTIVE_MEDICINES:
+            await state.clear()
+            await callback.message.edit_text(
+                f"Достигнут лимит в {MAX_ACTIVE_MEDICINES} препаратов. "
+                "Удалите один из них, чтобы добавить новый.",
+                reply_markup=menu(),
+            )
+            await callback.answer()
+            return
         await db.execute(
             """INSERT INTO medicines(
                    user_id, name, start_date, end_date, frequency, duration_kind, duration_amount
@@ -797,12 +837,15 @@ async def show_calendar(callback: CallbackQuery) -> None:
 async def show_day(callback: CallbackQuery) -> None:
     value = callback.data.split(":", 1)[1]
     selected = datetime.now(TIMEZONE).date() if value == "today" else date.fromisoformat(value)
-    await render_day(callback, callback.from_user.id, selected)
+    origin = "menu" if value == "today" else "calendar"
+    await render_day(callback, callback.from_user.id, selected, origin)
 
 
 @router.callback_query(F.data.startswith("toggle:"))
 async def toggle_intake(callback: CallbackQuery) -> None:
-    _, medicine_raw, dose_raw, iso_day = callback.data.split(":")
+    parts = callback.data.split(":")
+    _, medicine_raw, dose_raw, iso_day = parts[:4]
+    origin = parts[4] if len(parts) > 4 else "calendar"
     medicine_id = int(medicine_raw)
     dose_number = int(dose_raw)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -832,7 +875,7 @@ async def toggle_intake(callback: CallbackQuery) -> None:
                 (callback.from_user.id, medicine_id, iso_day, dose_number, datetime.now(TIMEZONE).isoformat()),
             )
         await db.commit()
-    await render_day(callback, callback.from_user.id, date.fromisoformat(iso_day))
+    await render_day(callback, callback.from_user.id, date.fromisoformat(iso_day), origin)
 
 
 @router.callback_query(F.data == "noop")
