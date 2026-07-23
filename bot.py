@@ -24,6 +24,7 @@ load_dotenv()
 DB_PATH = os.getenv("DATABASE_PATH", "pills.db")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 MAX_ACTIVE_MEDICINES = 20
+MAX_NOTE_LENGTH = 200
 router = Router()
 
 MONTHS = (
@@ -38,6 +39,7 @@ class AddMedicine(StatesGroup):
     custom_duration = State()
     start_date = State()
     frequency = State()
+    note = State()
     confirm = State()
 
 
@@ -45,6 +47,7 @@ class EditMedicine(StatesGroup):
     menu = State()
     custom_duration = State()
     start_date = State()
+    note = State()
 
 
 async def init_db() -> None:
@@ -110,6 +113,8 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE medicines ADD COLUMN duration_kind TEXT")
         if "duration_amount" not in columns:
             await db.execute("ALTER TABLE medicines ADD COLUMN duration_amount INTEGER")
+        if "note" not in columns:
+            await db.execute("ALTER TABLE medicines ADD COLUMN note TEXT")
         await db.execute(
             """UPDATE medicines
                SET duration_kind = CASE WHEN end_date IS NULL THEN 'forever' ELSE 'days' END,
@@ -177,15 +182,18 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
     current_time = current.time().replace(tzinfo=None)
     if current_time >= time(23, 0):
         due_slots = ((2, 2), (3, 3))
+        scheduled_time = "23:00"
     elif current_time >= time(17, 0):
-        due_slots = ((2, 1), (3, 2))
+        due_slots = ((3, 2),)
+        scheduled_time = "17:00"
     elif current_time >= time(11, 0):
-        due_slots = ((2, 1), (3, 1))
+        due_slots = ((1, 1), (2, 1), (3, 1))
+        scheduled_time = "11:00"
     else:
         return 0
 
     iso_day = current.date().isoformat()
-    sent = 0
+    reminders_by_user: dict[int, list[tuple[int, str, int, int]]] = {}
     for frequency, dose_number in due_slots:
         async with aiosqlite.connect(DB_PATH) as db:
             rows = await (await db.execute(
@@ -214,31 +222,49 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
             )).fetchall()
 
         for medicine_id, user_id, name in rows:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            reminders_by_user.setdefault(user_id, []).append(
+                (medicine_id, name, dose_number, frequency)
+            )
+
+    sent = 0
+    for user_id, reminders in reminders_by_user.items():
+        reminders.sort(key=lambda item: item[1].casefold())
+        keyboard_rows = []
+        for medicine_id, name, dose_number, frequency in reminders:
+            keyboard_rows.append([
                 InlineKeyboardButton(
-                    text="✅ Принято",
+                    text=f"✅ {name} — принято {dose_number} из {frequency}",
                     callback_data=f"remtaken:{medicine_id}:{dose_number}:{iso_day}",
                 ),
                 InlineKeyboardButton(
                     text="⏳ Ещё нет",
                     callback_data=f"remlater:{medicine_id}:{dose_number}:{iso_day}",
                 ),
-            ]])
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"💊 <b>{html.escape(name)}</b> — приём {dose_number} из {frequency}\n\nУже приняли?",
-                    reply_markup=keyboard,
-                )
-            except Exception:
-                continue
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "INSERT OR IGNORE INTO reminder_log VALUES (?, ?, ?, ?, ?)",
-                    (user_id, medicine_id, iso_day, dose_number, current.isoformat()),
-                )
-                await db.commit()
-            sent += 1
+            ])
+        try:
+            await bot.send_message(
+                user_id,
+                f"💊 <b>Приём препаратов · {scheduled_time}</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            )
+        except Exception:
+            continue
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO reminder_log VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        user_id,
+                        medicine_id,
+                        iso_day,
+                        dose_number,
+                        current.isoformat(),
+                    )
+                    for medicine_id, _, dose_number, _ in reminders
+                ],
+            )
+            await db.commit()
+        sent += len(reminders)
     return sent
 
 
@@ -412,7 +438,7 @@ async def add_medicine(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(AddMedicine.name)
     await callback.message.edit_text(
-        "<b>Шаг 1 из 5. Название</b>\n\nВведите название препарата.",
+        "<b>Шаг 1 из 6. Название</b>\n\nВведите название препарата.",
         reply_markup=cancel_keyboard(),
     )
     await callback.answer()
@@ -455,7 +481,7 @@ async def ask_start_date(target: Message | CallbackQuery, state: FSMContext) -> 
         [InlineKeyboardButton(text="Выбрать дату", callback_data="startdate:choose")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
-    text = "<b>Шаг 3 из 5. Дата начала</b>\n\nКогда начался или начнётся курс?"
+    text = "<b>Шаг 3 из 6. Дата начала</b>\n\nКогда начался или начнётся курс?"
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=keyboard)
         await target.answer()
@@ -469,7 +495,7 @@ async def choose_duration(callback: CallbackQuery, state: FSMContext) -> None:
     if parts[1] == "custom":
         await state.set_state(AddMedicine.custom_duration)
         await callback.message.edit_text(
-            "<b>Шаг 2 из 5. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>",
+            "<b>Шаг 2 из 6. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>",
             reply_markup=cancel_keyboard(),
         )
         await callback.answer()
@@ -503,7 +529,7 @@ async def medicine_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=name)
     await state.set_state(AddMedicine.duration)
     await message.answer(
-        "<b>Шаг 2 из 5. Длительность курса</b>\n\nКак долго нужно принимать препарат?",
+        "<b>Шаг 2 из 6. Длительность курса</b>\n\nКак долго нужно принимать препарат?",
         reply_markup=duration_keyboard(),
     )
 
@@ -524,7 +550,7 @@ async def save_start_date(target: CallbackQuery, state: FSMContext, selected: da
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
     await target.message.edit_text(
-        "<b>Шаг 4 из 5. Частота приёма</b>\n\nСколько раз в день нужно принимать препарат?",
+        "<b>Шаг 4 из 6. Частота приёма</b>\n\nСколько раз в день нужно принимать препарат?",
         reply_markup=keyboard,
     )
     await target.answer()
@@ -537,23 +563,67 @@ async def choose_frequency(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Некорректная частота", show_alert=True)
         return
     await state.update_data(frequency=frequency)
+    await state.set_state(AddMedicine.note)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Пропустить", callback_data="note:skip"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="menu"),
+    ]])
+    await callback.message.edit_text(
+        "<b>Шаг 5 из 6. Добавьте заметку о приёме препарата.</b>\n\n"
+        "Например: 2 таблетки после еды",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+async def show_add_confirmation(
+    target: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
     data = await state.get_data()
     await state.set_state(AddMedicine.confirm)
     end_text = date.fromisoformat(data["end_date"]).strftime("%d.%m.%Y") if data["end_date"] else "не ограничен"
+    note = data.get("note")
+    note_text = f"\nЗаметка: {html.escape(note)}" if note else ""
     text = (
-        "<b>Шаг 5 из 5. Проверка</b>\n\n"
+        "<b>Шаг 6 из 6. Проверка</b>\n\n"
         f"Препарат: <b>{html.escape(data['name'])}</b>\n"
         f"Курс: {data['duration_label']}\n"
         f"Начало: {date.fromisoformat(data['start_date']).strftime('%d.%m.%Y')}\n"
         f"Последний день приёма: {end_text}\n"
-        f"Частота: {frequency} раз(а) в день"
+        f"Частота: {data['frequency']} раз(а) в день"
+        f"{note_text}"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сохранить", callback_data="medicine:save")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=keyboard)
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(AddMedicine.note, F.data == "note:skip")
+async def skip_note(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(note=None)
+    await show_add_confirmation(callback, state)
+
+
+@router.message(AddMedicine.note)
+async def add_note(message: Message, state: FSMContext) -> None:
+    note = (message.text or "").strip()
+    if not note:
+        await message.answer("Введите текст заметки или нажмите «Пропустить».")
+        return
+    if len(note) > MAX_NOTE_LENGTH:
+        await message.answer(
+            f"Заметка должна быть не длиннее {MAX_NOTE_LENGTH} символов."
+        )
+        return
+    await state.update_data(note=note)
+    await show_add_confirmation(message, state)
 
 
 def start_calendar_markup(year: int, month: int) -> InlineKeyboardMarkup:
@@ -587,7 +657,7 @@ async def start_today(callback: CallbackQuery, state: FSMContext) -> None:
 async def choose_start_date(callback: CallbackQuery) -> None:
     today = datetime.now(TIMEZONE).date()
     await callback.message.edit_text(
-        "<b>Шаг 3 из 5. Дата начала</b>\n\nВыберите день начала курса:",
+        "<b>Шаг 3 из 6. Дата начала</b>\n\nВыберите день начала курса:",
         reply_markup=start_calendar_markup(today.year, today.month),
     )
     await callback.answer()
@@ -625,11 +695,12 @@ async def save_medicine(callback: CallbackQuery, state: FSMContext) -> None:
             return
         await db.execute(
             """INSERT INTO medicines(
-                   user_id, name, start_date, end_date, frequency, duration_kind, duration_amount
-               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   user_id, name, start_date, end_date, frequency,
+                   duration_kind, duration_amount, note
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 callback.from_user.id, data["name"], data["start_date"], data["end_date"],
-                data["frequency"], data["duration_kind"], data["duration_amount"],
+                data["frequency"], data["duration_kind"], data["duration_amount"], data.get("note"),
             ),
         )
         await db.commit()
@@ -646,7 +717,7 @@ async def list_medicines(callback: CallbackQuery) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         rows = await (await db.execute(
             """
-            SELECT m.id, m.name, m.start_date, m.end_date, m.frequency
+            SELECT m.id, m.name, m.start_date, m.end_date, m.frequency, m.note
             FROM medicines m
             WHERE m.user_id = ? AND m.active = 1
             ORDER BY m.name
@@ -654,9 +725,13 @@ async def list_medicines(callback: CallbackQuery) -> None:
             (callback.from_user.id,),
         )).fetchall()
     descriptions = []
-    for _, name, start_date, end_date, frequency in rows:
+    for _, name, start_date, end_date, frequency, note in rows:
         course = "бессрочно" if not end_date else f"до {date.fromisoformat(end_date).strftime('%d.%m.%Y')}"
-        descriptions.append(f"• <b>{html.escape(name)}</b>: {frequency} раз(а) в день; {course}")
+        description = f"• <b>{html.escape(name)}</b>: {frequency} раз(а) в день; {course}"
+        if note:
+            preview = note if len(note) <= 80 else note[:77] + "..."
+            description += f"\n  📝 {html.escape(preview)}"
+        descriptions.append(description)
     text = "📋 <b>Мои препараты</b>\n\n" + ("\n".join(descriptions) if rows else "Список пуст.")
     buttons = [
         [InlineKeyboardButton(text=f"✏️ {name}", callback_data=f"medicine:edit:{item_id}")]
@@ -670,7 +745,7 @@ async def list_medicines(callback: CallbackQuery) -> None:
 async def medicine_for_user(user_id: int, medicine_id: int) -> tuple | None:
     async with aiosqlite.connect(DB_PATH) as db:
         return await (await db.execute(
-            """SELECT id, name, start_date, end_date, frequency, duration_kind, duration_amount
+            """SELECT id, name, start_date, end_date, frequency, duration_kind, duration_amount, note
                FROM medicines WHERE id = ? AND user_id = ? AND active = 1""",
             (medicine_id, user_id),
         )).fetchone()
@@ -681,7 +756,7 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
     if not medicine:
         await callback.answer("Препарат не найден", show_alert=True)
         return
-    _, name, start_raw, end_raw, frequency, _, _ = medicine
+    _, name, start_raw, end_raw, frequency, _, _, note = medicine
     start_text = date.fromisoformat(start_raw).strftime("%d.%m.%Y") if start_raw else "не указана"
     end_text = date.fromisoformat(end_raw).strftime("%d.%m.%Y") if end_raw else "не ограничен"
     await state.set_state(EditMedicine.menu)
@@ -690,6 +765,7 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
         [InlineKeyboardButton(text="Изменить длительность", callback_data="editfield:duration")],
         [InlineKeyboardButton(text="Изменить дату начала", callback_data="editfield:start")],
         [InlineKeyboardButton(text="Изменить частоту", callback_data="editfield:frequency")],
+        [InlineKeyboardButton(text="Изменить заметку", callback_data="editfield:note")],
         [InlineKeyboardButton(text="🗑 Удалить препарат", callback_data=f"medicine:delete:{medicine_id}")],
         [InlineKeyboardButton(text="← Мои препараты", callback_data="medicine:list")],
     ])
@@ -697,7 +773,8 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
         f"✏️ <b>{html.escape(name)}</b>\n\n"
         f"Дата начала: {start_text}\n"
         f"Последний день приёма: {end_text}\n"
-        f"Частота: {frequency} раз(а) в день\n\n"
+        f"Частота: {frequency} раз(а) в день\n"
+        f"Заметка: {html.escape(note) if note else 'не добавлена'}\n\n"
         "Что изменить?",
         reply_markup=keyboard,
     )
@@ -790,6 +867,76 @@ async def edit_frequency(callback: CallbackQuery) -> None:
     ])
     await callback.message.edit_text("Выберите новую частоту приёма:", reply_markup=keyboard)
     await callback.answer()
+
+
+@router.callback_query(EditMedicine.menu, F.data == "editfield:note")
+async def edit_note(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    medicine = await medicine_for_user(
+        callback.from_user.id, data["edit_medicine_id"]
+    )
+    if not medicine:
+        await callback.answer("Препарат не найден", show_alert=True)
+        return
+    await state.set_state(EditMedicine.note)
+    buttons = []
+    if medicine[7]:
+        buttons.append([
+            InlineKeyboardButton(text="Удалить заметку", callback_data="editnote:delete")
+        ])
+    buttons.append([
+        InlineKeyboardButton(
+            text="← Назад",
+            callback_data=f"medicine:edit:{data['edit_medicine_id']}",
+        )
+    ])
+    await callback.message.edit_text(
+        f"Введите новую заметку — до {MAX_NOTE_LENGTH} символов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@router.message(EditMedicine.note)
+async def save_edited_note(message: Message, state: FSMContext) -> None:
+    note = (message.text or "").strip()
+    if not note:
+        await message.answer("Введите текст заметки.")
+        return
+    if len(note) > MAX_NOTE_LENGTH:
+        await message.answer(
+            f"Заметка должна быть не длиннее {MAX_NOTE_LENGTH} символов."
+        )
+        return
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE medicines SET note=? WHERE id=? AND user_id=? AND active=1",
+            (note, data["edit_medicine_id"], message.from_user.id),
+        )
+        await db.commit()
+    await state.set_state(EditMedicine.menu)
+    await message.answer(
+        "Заметка обновлена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="← Вернуться к препарату",
+                callback_data=f"medicine:edit:{data['edit_medicine_id']}",
+            )
+        ]]),
+    )
+
+
+@router.callback_query(EditMedicine.note, F.data == "editnote:delete")
+async def delete_note(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE medicines SET note=NULL WHERE id=? AND user_id=? AND active=1",
+            (data["edit_medicine_id"], callback.from_user.id),
+        )
+        await db.commit()
+    await render_edit_menu(callback, state, data["edit_medicine_id"])
 
 
 def edit_start_calendar_markup(year: int, month: int, medicine_id: int) -> InlineKeyboardMarkup:
@@ -981,6 +1128,30 @@ async def reminder_medicine(
     return (row[0], row[1]) if row else None
 
 
+async def update_reminder_button(
+    callback: CallbackQuery,
+    status_text: str,
+) -> None:
+    markup = callback.message.reply_markup
+    if not markup:
+        await callback.message.edit_text(status_text)
+        return
+    updated_rows = []
+    replaced = False
+    for row in markup.inline_keyboard:
+        if any(button.callback_data == callback.data for button in row):
+            updated_rows.append([
+                InlineKeyboardButton(text=status_text, callback_data="noop")
+            ])
+            replaced = True
+        else:
+            updated_rows.append(list(row))
+    if replaced:
+        await callback.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=updated_rows)
+        )
+
+
 @router.callback_query(F.data.startswith("remtaken:"))
 async def reminder_taken(callback: CallbackQuery) -> None:
     _, medicine_raw, dose_raw, iso_day = callback.data.split(":")
@@ -1005,8 +1176,9 @@ async def reminder_taken(callback: CallbackQuery) -> None:
             ),
         )
         await db.commit()
-    await callback.message.edit_text(
-        f"✅ <b>{html.escape(name)}</b> — приём {dose_number} из {frequency} отмечен"
+    await update_reminder_button(
+        callback,
+        f"✅ {name} — принято {dose_number} из {frequency}",
     )
     await callback.answer("Приём отмечен")
 
@@ -1023,8 +1195,9 @@ async def reminder_not_yet(callback: CallbackQuery) -> None:
         await callback.answer("Приём не найден", show_alert=True)
         return
     name, frequency = medicine
-    await callback.message.edit_text(
-        f"⏳ <b>{html.escape(name)}</b> — приём {dose_number} из {frequency} пока не отмечен"
+    await update_reminder_button(
+        callback,
+        f"⏳ {name} — ещё нет · {dose_number} из {frequency}",
     )
     await callback.answer()
 
