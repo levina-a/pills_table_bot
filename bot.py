@@ -121,6 +121,20 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE medicines ADD COLUMN duration_amount INTEGER")
         if "note" not in columns:
             await db.execute("ALTER TABLE medicines ADD COLUMN note TEXT")
+        reminder_columns = {
+            row[1]
+            for row in await (await db.execute(
+                "PRAGMA table_info(reminder_log)"
+            )).fetchall()
+        }
+        if "response_status" not in reminder_columns:
+            await db.execute(
+                "ALTER TABLE reminder_log ADD COLUMN response_status TEXT"
+            )
+        if "responded_at" not in reminder_columns:
+            await db.execute(
+                "ALTER TABLE reminder_log ADD COLUMN responded_at TEXT"
+            )
         await db.execute(
             """UPDATE medicines
                SET duration_kind = CASE WHEN end_date IS NULL THEN 'forever' ELSE 'days' END,
@@ -200,7 +214,9 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
         return 0
 
     iso_day = current.date().isoformat()
-    reminders_by_user: dict[int, list[tuple[int, str, int, int]]] = {}
+    reminders_by_user: dict[
+        int, dict[tuple[int, int], tuple[int, str, int, int]]
+    ] = {}
     for frequency, dose_number in due_slots:
         async with aiosqlite.connect(DB_PATH) as db:
             rows = await (await db.execute(
@@ -229,13 +245,58 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
             )).fetchall()
 
         for medicine_id, user_id, name in rows:
-            reminders_by_user.setdefault(user_id, []).append(
-                (medicine_id, name, dose_number, frequency)
-            )
+            reminders_by_user.setdefault(user_id, {})[
+                (medicine_id, dose_number)
+            ] = (medicine_id, name, dose_number, frequency)
+
+    if not reminders_by_user:
+        return 0
+
+    schedule_minutes = {
+        (1, 1): 11 * 60,
+        (2, 1): 11 * 60,
+        (2, 2): 23 * 60,
+        (3, 1): 11 * 60,
+        (3, 2): 17 * 60,
+        (3, 3): 23 * 60,
+    }
+    current_slot_minutes = int(scheduled_time[:2]) * 60
+    async with aiosqlite.connect(DB_PATH) as db:
+        unanswered = await (await db.execute(
+            """
+            SELECT m.id, m.user_id, m.name, r.dose_number, m.frequency
+            FROM reminder_log r
+            JOIN medicines m ON m.id = r.medicine_id
+                AND m.user_id = r.user_id
+            LEFT JOIN dose_log d ON d.medicine_id = r.medicine_id
+                AND d.user_id = r.user_id
+                AND d.intake_date = r.reminder_date
+                AND d.dose_number = r.dose_number
+            WHERE r.reminder_date = ?
+              AND r.response_status IS NULL
+              AND d.medicine_id IS NULL
+              AND m.active = 1
+              AND (m.start_date IS NULL OR m.start_date <= ?)
+              AND (m.end_date IS NULL OR m.end_date >= ?)
+            """,
+            (iso_day, iso_day, iso_day),
+        )).fetchall()
+    for medicine_id, user_id, name, dose_number, frequency in unanswered:
+        if user_id not in reminders_by_user:
+            continue
+        if schedule_minutes.get((frequency, dose_number), current_slot_minutes) >= current_slot_minutes:
+            continue
+        reminders_by_user[user_id].setdefault(
+            (medicine_id, dose_number),
+            (medicine_id, name, dose_number, frequency),
+        )
 
     sent = 0
-    for user_id, reminders in reminders_by_user.items():
-        reminders.sort(key=lambda item: item[1].casefold())
+    for user_id, reminder_map in reminders_by_user.items():
+        reminders = sorted(
+            reminder_map.values(),
+            key=lambda item: (item[1].casefold(), item[2]),
+        )
         keyboard_rows = []
         for medicine_id, name, dose_number, frequency in reminders:
             keyboard_rows.append([
@@ -263,7 +324,9 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
             continue
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executemany(
-                "INSERT OR IGNORE INTO reminder_log VALUES (?, ?, ?, ?, ?)",
+                """INSERT OR IGNORE INTO reminder_log(
+                       user_id, medicine_id, reminder_date, dose_number, sent_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
                 [
                     (
                         user_id,
@@ -1142,7 +1205,7 @@ async def reminder_medicine(
     async with aiosqlite.connect(DB_PATH) as db:
         row = await (await db.execute(
             """SELECT name, frequency FROM medicines
-               WHERE id = ? AND user_id = ? AND active = 1 AND frequency IN (2, 3)
+               WHERE id = ? AND user_id = ? AND active = 1 AND frequency IN (1, 2, 3)
                  AND ? BETWEEN 1 AND frequency
                  AND (start_date IS NULL OR start_date <= ?)
                  AND (end_date IS NULL OR end_date >= ?)""",
@@ -1198,6 +1261,19 @@ async def reminder_taken(callback: CallbackQuery) -> None:
                 datetime.now(TIMEZONE).isoformat(),
             ),
         )
+        await db.execute(
+            """UPDATE reminder_log
+               SET response_status='taken', responded_at=?
+               WHERE user_id=? AND medicine_id=?
+                 AND reminder_date=? AND dose_number=?""",
+            (
+                datetime.now(TIMEZONE).isoformat(),
+                callback.from_user.id,
+                medicine_id,
+                iso_day,
+                dose_number,
+            ),
+        )
         await db.commit()
     await update_reminder_button(
         callback,
@@ -1218,6 +1294,21 @@ async def reminder_not_yet(callback: CallbackQuery) -> None:
         await callback.answer("Приём не найден", show_alert=True)
         return
     name, frequency = medicine
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE reminder_log
+               SET response_status='not_yet', responded_at=?
+               WHERE user_id=? AND medicine_id=?
+                 AND reminder_date=? AND dose_number=?""",
+            (
+                datetime.now(TIMEZONE).isoformat(),
+                callback.from_user.id,
+                medicine_id,
+                iso_day,
+                dose_number,
+            ),
+        )
+        await db.commit()
     await update_reminder_button(
         callback,
         f"⏳ {name} — ещё нет · {dose_number} из {frequency}",
