@@ -6,7 +6,8 @@ import contextlib
 import html
 import logging
 import os
-from datetime import date, datetime, time, timedelta
+import re
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -39,6 +40,11 @@ MONTHS = (
 )
 WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 ALL_WEEKDAYS = tuple(range(7))
+DEFAULT_NOTIFICATION_TIMES = {
+    1: ("11:00",),
+    2: ("11:00", "23:00"),
+    3: ("11:00", "17:00", "23:00"),
+}
 
 
 class AddMedicine(StatesGroup):
@@ -58,6 +64,11 @@ class EditMedicine(StatesGroup):
     start_date = State()
     weekdays = State()
     note = State()
+
+
+class NotificationSettings(StatesGroup):
+    global_times = State()
+    medicine_times = State()
 
 
 async def init_db() -> None:
@@ -109,6 +120,19 @@ async def init_db() -> None:
                 dose_number INTEGER NOT NULL,
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, medicine_id, reminder_date, dose_number)
+            );
+            CREATE TABLE IF NOT EXISTS notification_settings (
+                user_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                times_1 TEXT NOT NULL DEFAULT '11:00',
+                times_2 TEXT NOT NULL DEFAULT '11:00,23:00',
+                times_3 TEXT NOT NULL DEFAULT '11:00,17:00,23:00'
+            );
+            CREATE TABLE IF NOT EXISTS medicine_notification_times (
+                medicine_id INTEGER PRIMARY KEY
+                    REFERENCES medicines(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL,
+                times TEXT NOT NULL
             );
             """
         )
@@ -179,6 +203,7 @@ def menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Календарь", callback_data="calendar:today")],
         [InlineKeyboardButton(text="➕ Добавить препарат", callback_data="medicine:add")],
         [InlineKeyboardButton(text="📋 Мои препараты", callback_data="medicine:list")],
+        [InlineKeyboardButton(text="🔔 Настройки уведомлений", callback_data="notifications")],
     ])
 
 
@@ -208,103 +233,170 @@ async def day_data(user_id: int, iso_day: str) -> list[tuple]:
     ]
 
 
+def serialize_times(values: tuple[str, ...] | list[str]) -> str:
+    return ",".join(values)
+
+
+def parse_times(value: str | None, frequency: int) -> tuple[str, ...]:
+    if value:
+        values = tuple(item.strip() for item in value.split(","))
+        if len(values) == frequency and all(
+            re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", item)
+            for item in values
+        ):
+            return values
+    return DEFAULT_NOTIFICATION_TIMES[frequency]
+
+
+def validate_times_input(raw: str, frequency: int) -> tuple[tuple[str, ...] | None, str | None]:
+    value = raw.strip()
+    if not value or (frequency > 1 and "," not in value):
+        return None, (
+            "Разделите время запятыми.\n\n"
+            f"Например: {', '.join(DEFAULT_NOTIFICATION_TIMES[frequency])}"
+        )
+    parts = [item.strip() for item in value.split(",")]
+    if any(not item for item in parts):
+        return None, (
+            "Разделите время запятыми без пустых значений.\n\n"
+            f"Например: {', '.join(DEFAULT_NOTIFICATION_TIMES[frequency])}"
+        )
+    if len(parts) != frequency:
+        return None, (
+            f"Для схемы «{frequency} раз{'а' if frequency in (2, 3) else ''} в день» "
+            f"нужно указать ровно {frequency} "
+            f"{'время' if frequency == 1 else 'времени'}.\n\n"
+            f"Например: {', '.join(DEFAULT_NOTIFICATION_TIMES[frequency])}"
+        )
+    if any(
+        not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", item)
+        for item in parts
+    ):
+        return None, (
+            "Введите время в формате ЧЧ:ММ.\n\n"
+            f"Например: {', '.join(DEFAULT_NOTIFICATION_TIMES[frequency])}"
+        )
+    if len(set(parts)) != len(parts):
+        return None, "Время приёмов не должно повторяться."
+    return tuple(sorted(parts)), None
+
+
+async def ensure_notification_settings(db: aiosqlite.Connection, user_id: int) -> None:
+    await db.execute(
+        "INSERT OR IGNORE INTO notification_settings(user_id) VALUES (?)",
+        (user_id,),
+    )
+
+
 async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
     current = now or datetime.now(TIMEZONE)
-    current_time = current.time().replace(tzinfo=None)
-    if current_time >= time(23, 0):
-        due_slots = ((2, 2), (3, 3))
-        scheduled_time = "23:00"
-    elif current_time >= time(17, 0):
-        due_slots = ((3, 2),)
-        scheduled_time = "17:00"
-    elif current_time >= time(11, 0):
-        due_slots = ((1, 1), (2, 1), (3, 1))
-        scheduled_time = "11:00"
-    else:
-        return 0
-
     iso_day = current.date().isoformat()
-    reminders_by_user: dict[
-        int, dict[tuple[int, int], tuple[int, str, int, int]]
+    current_hhmm = current.strftime("%H:%M")
+    reminder_groups: dict[
+        tuple[int, str], dict[tuple[int, int], tuple[int, str, int, int]]
     ] = {}
-    for frequency, dose_number in due_slots:
-        async with aiosqlite.connect(DB_PATH) as db:
-            rows = await (await db.execute(
-                """
-                SELECT m.id, m.user_id, m.name
-                FROM medicines m
-                LEFT JOIN dose_log d ON d.medicine_id = m.id
-                    AND d.user_id = m.user_id
-                    AND d.intake_date = ?
-                    AND d.dose_number = ?
-                LEFT JOIN reminder_log r ON r.medicine_id = m.id
-                    AND r.user_id = m.user_id
-                    AND r.reminder_date = ?
-                    AND r.dose_number = ?
-                WHERE m.active = 1
-                  AND m.frequency = ?
-                  AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
-                  AND (m.start_date IS NULL OR m.start_date <= ?)
-                  AND (m.end_date IS NULL OR m.end_date >= ?)
-                  AND d.medicine_id IS NULL
-                  AND r.medicine_id IS NULL
-                """,
-                (
-                    iso_day, dose_number, iso_day, dose_number,
-                    frequency, current.weekday(), iso_day, iso_day,
-                ),
-            )).fetchall()
-
-        for medicine_id, user_id, name in rows:
-            reminders_by_user.setdefault(user_id, {})[
-                (medicine_id, dose_number)
-            ] = (medicine_id, name, dose_number, frequency)
-
-    if not reminders_by_user:
-        return 0
-
-    schedule_minutes = {
-        (1, 1): 11 * 60,
-        (2, 1): 11 * 60,
-        (2, 2): 23 * 60,
-        (3, 1): 11 * 60,
-        (3, 2): 17 * 60,
-        (3, 3): 23 * 60,
-    }
-    current_slot_minutes = int(scheduled_time[:2]) * 60
     async with aiosqlite.connect(DB_PATH) as db:
-        unanswered = await (await db.execute(
+        rows = await (await db.execute(
             """
-            SELECT m.id, m.user_id, m.name, r.dose_number, m.frequency
-            FROM reminder_log r
-            JOIN medicines m ON m.id = r.medicine_id
-                AND m.user_id = r.user_id
-            LEFT JOIN dose_log d ON d.medicine_id = r.medicine_id
-                AND d.user_id = r.user_id
-                AND d.intake_date = r.reminder_date
-                AND d.dose_number = r.dose_number
-            WHERE r.reminder_date = ?
-              AND r.response_status IS NULL
-              AND d.medicine_id IS NULL
-              AND m.active = 1
+            SELECT m.id, m.user_id, m.name, m.frequency,
+                   COALESCE(
+                       mt.times,
+                       CASE m.frequency
+                           WHEN 1 THEN ns.times_1
+                           WHEN 2 THEN ns.times_2
+                           WHEN 3 THEN ns.times_3
+                       END
+                   ) AS effective_times
+            FROM medicines m
+            LEFT JOIN notification_settings ns ON ns.user_id = m.user_id
+            LEFT JOIN medicine_notification_times mt
+                ON mt.medicine_id = m.id AND mt.user_id = m.user_id
+            WHERE m.active = 1
+              AND COALESCE(ns.enabled, 1) = 1
               AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
               AND (m.start_date IS NULL OR m.start_date <= ?)
               AND (m.end_date IS NULL OR m.end_date >= ?)
             """,
-            (iso_day, current.weekday(), iso_day, iso_day),
+            (current.weekday(), iso_day, iso_day),
         )).fetchall()
-    for medicine_id, user_id, name, dose_number, frequency in unanswered:
-        if user_id not in reminders_by_user:
+        sent_rows = await (await db.execute(
+            """SELECT user_id, medicine_id, dose_number
+               FROM reminder_log WHERE reminder_date = ?""",
+            (iso_day,),
+        )).fetchall()
+        taken_rows = await (await db.execute(
+            """SELECT user_id, medicine_id, dose_number
+               FROM dose_log WHERE intake_date = ?""",
+            (iso_day,),
+        )).fetchall()
+    already_sent = set(sent_rows)
+    already_taken = set(taken_rows)
+
+    for medicine_id, user_id, name, frequency, raw_times in rows:
+        times = parse_times(raw_times, frequency)
+        due = [
+            (dose_number, scheduled_time)
+            for dose_number, scheduled_time in enumerate(times, start=1)
+            if scheduled_time <= current_hhmm
+            and (user_id, medicine_id, dose_number) not in already_sent
+            and (user_id, medicine_id, dose_number) not in already_taken
+        ]
+        if not due:
             continue
-        if schedule_minutes.get((frequency, dose_number), current_slot_minutes) >= current_slot_minutes:
+        # Если бот ненадолго перезапускался, отправляем последний актуальный
+        # приём, а не несколько отдельных старых уведомлений одновременно.
+        dose_number, scheduled_time = due[-1]
+        reminder_groups.setdefault((user_id, scheduled_time), {})[
+            (medicine_id, dose_number)
+        ] = (medicine_id, name, dose_number, frequency)
+
+    # Один пользователь получает одну актуальную группу за проход планировщика.
+    # Это защищает от нескольких сообщений сразу после перезапуска бота.
+    latest_by_user: dict[
+        int, tuple[str, dict[tuple[int, int], tuple[int, str, int, int]]]
+    ] = {}
+    for (user_id, scheduled_time), reminder_map in reminder_groups.items():
+        previous = latest_by_user.get(user_id)
+        if previous is None:
+            latest_by_user[user_id] = (scheduled_time, dict(reminder_map))
             continue
-        reminders_by_user[user_id].setdefault(
-            (medicine_id, dose_number),
-            (medicine_id, name, dose_number, frequency),
-        )
+        latest_time = max(previous[0], scheduled_time)
+        previous[1].update(reminder_map)
+        latest_by_user[user_id] = (latest_time, previous[1])
+    reminder_groups = {
+        (user_id, scheduled_time): reminder_map
+        for user_id, (scheduled_time, reminder_map) in latest_by_user.items()
+    }
 
     sent = 0
-    for user_id, reminder_map in reminders_by_user.items():
+    for (user_id, scheduled_time), reminder_map in sorted(reminder_groups.items()):
+        async with aiosqlite.connect(DB_PATH) as db:
+            unanswered = await (await db.execute(
+                """
+                SELECT m.id, m.name, r.dose_number, m.frequency
+                FROM reminder_log r
+                JOIN medicines m ON m.id = r.medicine_id
+                    AND m.user_id = r.user_id
+                LEFT JOIN dose_log d ON d.medicine_id = r.medicine_id
+                    AND d.user_id = r.user_id
+                    AND d.intake_date = r.reminder_date
+                    AND d.dose_number = r.dose_number
+                WHERE r.user_id = ?
+                  AND r.reminder_date = ?
+                  AND r.response_status IS NULL
+                  AND d.medicine_id IS NULL
+                  AND m.active = 1
+                  AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
+                  AND (m.start_date IS NULL OR m.start_date <= ?)
+                  AND (m.end_date IS NULL OR m.end_date >= ?)
+                """,
+                (user_id, iso_day, current.weekday(), iso_day, iso_day),
+            )).fetchall()
+        for medicine_id, name, dose_number, frequency in unanswered:
+            reminder_map.setdefault(
+                (medicine_id, dose_number),
+                (medicine_id, name, dose_number, frequency),
+            )
         reminders = sorted(
             reminder_map.values(),
             key=lambda item: (item[1].casefold(), item[2]),
@@ -519,6 +611,313 @@ async def show_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text("Выберите действие", reply_markup=menu())
     await callback.answer()
+
+
+async def render_notification_settings(
+    callback: CallbackQuery,
+    state: FSMContext | None = None,
+) -> None:
+    if state:
+        await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await ensure_notification_settings(db, callback.from_user.id)
+        settings = await (await db.execute(
+            """SELECT enabled, times_1, times_2, times_3
+               FROM notification_settings WHERE user_id = ?""",
+            (callback.from_user.id,),
+        )).fetchone()
+        await db.commit()
+    enabled, times_1, times_2, times_3 = settings
+    status = "✅ включены" if enabled else "❌ выключены"
+    toggle_text = "🔕 Выключить уведомления" if enabled else "🔔 Включить уведомления"
+    text = (
+        "🔔 <b>Настройки уведомлений</b>\n\n"
+        f"Статус: {status}\n\n"
+        "Общее расписание:\n"
+        f"• 1 раз в день — {', '.join(parse_times(times_1, 1))}\n"
+        f"• 2 раза в день — {', '.join(parse_times(times_2, 2))}\n"
+        f"• 3 раза в день — {', '.join(parse_times(times_3, 3))}"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data="notifications:toggle")],
+        [InlineKeyboardButton(
+            text="Настроить другое время для всех",
+            callback_data="notifications:global",
+        )],
+        [InlineKeyboardButton(
+            text="Настроить для препарата",
+            callback_data="notifications:medicine",
+        )],
+        [InlineKeyboardButton(text="← Меню", callback_data="menu")],
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "notifications")
+async def notification_settings(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await render_notification_settings(callback, state)
+
+
+@router.callback_query(F.data == "notifications:toggle")
+async def toggle_notifications(callback: CallbackQuery) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await ensure_notification_settings(db, callback.from_user.id)
+        await db.execute(
+            """UPDATE notification_settings
+               SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END
+               WHERE user_id = ?""",
+            (callback.from_user.id,),
+        )
+        await db.commit()
+    await render_notification_settings(callback)
+
+
+@router.callback_query(F.data == "notifications:global")
+async def choose_global_notification_frequency(callback: CallbackQuery) -> None:
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 раз в день", callback_data="notifyglobal:1")],
+        [InlineKeyboardButton(text="2 раза в день", callback_data="notifyglobal:2")],
+        [InlineKeyboardButton(text="3 раза в день", callback_data="notifyglobal:3")],
+        [InlineKeyboardButton(text="← Назад", callback_data="notifications")],
+    ])
+    await callback.message.edit_text(
+        "<b>Для какой частоты изменить общее время?</b>",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("notifyglobal:"))
+async def ask_global_notification_times(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    frequency = int(callback.data.split(":", 1)[1])
+    if frequency not in (1, 2, 3):
+        await callback.answer("Некорректная частота", show_alert=True)
+        return
+    await state.set_state(NotificationSettings.global_times)
+    await state.update_data(notification_frequency=frequency)
+    example = ", ".join(DEFAULT_NOTIFICATION_TIMES[frequency])
+    await callback.message.edit_text(
+        f"<b>Введите {frequency} "
+        f"{'время' if frequency == 1 else 'времени'} через запятую.</b>\n\n"
+        f"Например: <code>{example}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="notifications")
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.message(NotificationSettings.global_times)
+async def save_global_notification_times(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    frequency = data["notification_frequency"]
+    values, error = validate_times_input(message.text or "", frequency)
+    if error:
+        await message.answer(
+            error,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="notifications")
+            ]]),
+        )
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await ensure_notification_settings(db, message.from_user.id)
+        await db.execute(
+            f"UPDATE notification_settings SET times_{frequency} = ? WHERE user_id = ?",
+            (serialize_times(values), message.from_user.id),
+        )
+        await db.commit()
+    await state.clear()
+    await message.answer(
+        "Общее время сохранено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="← К настройкам", callback_data="notifications")
+        ]]),
+    )
+
+
+@router.callback_query(F.data == "notifications:medicine")
+async def choose_notification_medicine(callback: CallbackQuery) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        medicines = await (await db.execute(
+            """SELECT id, name FROM medicines
+               WHERE user_id = ? AND active = 1 ORDER BY name""",
+            (callback.from_user.id,),
+        )).fetchall()
+    rows = [
+        [InlineKeyboardButton(text=f"💊 {name}", callback_data=f"notifymed:{medicine_id}")]
+        for medicine_id, name in medicines
+    ]
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="notifications")])
+    await callback.message.edit_text(
+        "<b>Выберите препарат:</b>\n\n"
+        + ("" if medicines else "Активных препаратов пока нет."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+async def notification_medicine_data(user_id: int, medicine_id: int) -> tuple | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await ensure_notification_settings(db, user_id)
+        row = await (await db.execute(
+            """
+            SELECT m.name, m.frequency, mt.times,
+                   CASE m.frequency
+                       WHEN 1 THEN ns.times_1
+                       WHEN 2 THEN ns.times_2
+                       WHEN 3 THEN ns.times_3
+                   END
+            FROM medicines m
+            JOIN notification_settings ns ON ns.user_id = m.user_id
+            LEFT JOIN medicine_notification_times mt
+                ON mt.medicine_id = m.id AND mt.user_id = m.user_id
+            WHERE m.id = ? AND m.user_id = ? AND m.active = 1
+            """,
+            (medicine_id, user_id),
+        )).fetchone()
+        await db.commit()
+    return row
+
+
+async def render_notification_medicine(
+    callback: CallbackQuery,
+    medicine_id: int,
+) -> None:
+    medicine = await notification_medicine_data(callback.from_user.id, medicine_id)
+    if not medicine:
+        await callback.answer("Препарат не найден", show_alert=True)
+        return
+    name, frequency, custom_times, global_times = medicine
+    effective = parse_times(custom_times or global_times, frequency)
+    source = "индивидуальное" if custom_times else "общее"
+    rows = [[InlineKeyboardButton(
+        text="Изменить время",
+        callback_data=f"notifymededit:{medicine_id}",
+    )]]
+    if custom_times:
+        rows.append([InlineKeyboardButton(
+            text="Использовать общее расписание",
+            callback_data=f"notifymedreset:{medicine_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="← К препаратам",
+        callback_data="notifications:medicine",
+    )])
+    await callback.message.edit_text(
+        f"💊 <b>{html.escape(name)}</b>\n\n"
+        f"Частота: {frequency} раз(а) в день\n"
+        f"Время: {', '.join(effective)}\n"
+        f"Расписание: {source}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("notifymed:"))
+async def show_notification_medicine(callback: CallbackQuery) -> None:
+    medicine_id = int(callback.data.split(":", 1)[1])
+    await render_notification_medicine(callback, medicine_id)
+
+
+@router.callback_query(F.data.startswith("notifymededit:"))
+async def ask_medicine_notification_times(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    medicine_id = int(callback.data.split(":", 1)[1])
+    medicine = await notification_medicine_data(callback.from_user.id, medicine_id)
+    if not medicine:
+        await callback.answer("Препарат не найден", show_alert=True)
+        return
+    name, frequency, _, _ = medicine
+    await state.set_state(NotificationSettings.medicine_times)
+    await state.update_data(
+        notification_medicine_id=medicine_id,
+        notification_frequency=frequency,
+    )
+    example = ", ".join(DEFAULT_NOTIFICATION_TIMES[frequency])
+    await callback.message.edit_text(
+        f"💊 <b>{html.escape(name)}</b>\n\n"
+        f"Введите {frequency} "
+        f"{'время' if frequency == 1 else 'времени'} через запятую.\n\n"
+        f"Например: <code>{example}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"notifymed:{medicine_id}",
+            )
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.message(NotificationSettings.medicine_times)
+async def save_medicine_notification_times(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    frequency = data["notification_frequency"]
+    medicine_id = data["notification_medicine_id"]
+    values, error = validate_times_input(message.text or "", frequency)
+    if error:
+        await message.answer(
+            error,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"notifymed:{medicine_id}",
+                )
+            ]]),
+        )
+        return
+    medicine = await notification_medicine_data(message.from_user.id, medicine_id)
+    if not medicine or medicine[1] != frequency:
+        await state.clear()
+        await message.answer(
+            "Частота препарата изменилась. Настройте время заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="← К настройкам", callback_data="notifications")
+            ]]),
+        )
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO medicine_notification_times(medicine_id, user_id, times)
+               VALUES (?, ?, ?)
+               ON CONFLICT(medicine_id) DO UPDATE SET
+                   user_id=excluded.user_id, times=excluded.times""",
+            (medicine_id, message.from_user.id, serialize_times(values)),
+        )
+        await db.commit()
+    await state.clear()
+    await message.answer(
+        "Индивидуальное время сохранено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="← К препарату",
+                callback_data=f"notifymed:{medicine_id}",
+            )
+        ]]),
+    )
+
+
+@router.callback_query(F.data.startswith("notifymedreset:"))
+async def reset_medicine_notification_times(callback: CallbackQuery) -> None:
+    medicine_id = int(callback.data.split(":", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """DELETE FROM medicine_notification_times
+               WHERE medicine_id = ? AND user_id = ?""",
+            (medicine_id, callback.from_user.id),
+        )
+        await db.commit()
+    await render_notification_medicine(callback, medicine_id)
 
 
 @router.callback_query(F.data == "medicine:add")
@@ -1361,6 +1760,11 @@ async def choose_edit_frequency(callback: CallbackQuery, state: FSMContext) -> N
         await db.execute(
             "UPDATE medicines SET frequency=? WHERE id=? AND user_id=? AND active=1",
             (frequency, data["edit_medicine_id"], callback.from_user.id),
+        )
+        await db.execute(
+            """DELETE FROM medicine_notification_times
+               WHERE medicine_id=? AND user_id=?""",
+            (data["edit_medicine_id"], callback.from_user.id),
         )
         await db.commit()
     await render_edit_menu(callback, state, data["edit_medicine_id"])
