@@ -401,6 +401,10 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
             reminder_map.values(),
             key=lambda item: (item[1].casefold(), item[2]),
         )
+        medicine_names = ", ".join(
+            html.escape(name)
+            for name in dict.fromkeys(item[1] for item in reminders)
+        )
         keyboard_rows = []
         for medicine_id, name, dose_number, frequency in reminders:
             keyboard_rows.append([
@@ -416,7 +420,7 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
         try:
             await bot.send_message(
                 user_id,
-                f"💊 <b>Приём препаратов · {scheduled_time}</b>",
+                f"💊 <b>Приём препаратов {medicine_names} · {scheduled_time}</b>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
             )
         except Exception:
