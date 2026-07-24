@@ -37,6 +37,8 @@ MONTHS = (
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 )
+WEEKDAY_LABELS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+ALL_WEEKDAYS = tuple(range(7))
 
 
 class AddMedicine(StatesGroup):
@@ -45,6 +47,7 @@ class AddMedicine(StatesGroup):
     custom_duration = State()
     start_date = State()
     frequency = State()
+    weekdays = State()
     note = State()
     confirm = State()
 
@@ -53,6 +56,7 @@ class EditMedicine(StatesGroup):
     menu = State()
     custom_duration = State()
     start_date = State()
+    weekdays = State()
     note = State()
 
 
@@ -121,6 +125,11 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE medicines ADD COLUMN duration_amount INTEGER")
         if "note" not in columns:
             await db.execute("ALTER TABLE medicines ADD COLUMN note TEXT")
+        if "weekdays" not in columns:
+            await db.execute(
+                "ALTER TABLE medicines "
+                "ADD COLUMN weekdays TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6'"
+            )
         reminder_columns = {
             row[1]
             for row in await (await db.execute(
@@ -182,9 +191,10 @@ async def day_data(user_id: int, iso_day: str) -> list[tuple]:
             WHERE m.user_id = ? AND m.active = 1
               AND (m.start_date IS NULL OR m.start_date <= ?)
               AND (m.end_date IS NULL OR m.end_date >= ?)
+              AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
             ORDER BY m.name
             """,
-            (user_id, iso_day, iso_day),
+            (user_id, iso_day, iso_day, date.fromisoformat(iso_day).weekday()),
         )).fetchall()
         taken_rows = await (await db.execute(
             "SELECT medicine_id, dose_number FROM dose_log WHERE user_id = ? AND intake_date = ?",
@@ -233,6 +243,7 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
                     AND r.dose_number = ?
                 WHERE m.active = 1
                   AND m.frequency = ?
+                  AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
                   AND (m.start_date IS NULL OR m.start_date <= ?)
                   AND (m.end_date IS NULL OR m.end_date >= ?)
                   AND d.medicine_id IS NULL
@@ -240,7 +251,7 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
                 """,
                 (
                     iso_day, dose_number, iso_day, dose_number,
-                    frequency, iso_day, iso_day,
+                    frequency, current.weekday(), iso_day, iso_day,
                 ),
             )).fetchall()
 
@@ -276,10 +287,11 @@ async def send_due_reminders(bot: Bot, now: datetime | None = None) -> int:
               AND r.response_status IS NULL
               AND d.medicine_id IS NULL
               AND m.active = 1
+              AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
               AND (m.start_date IS NULL OR m.start_date <= ?)
               AND (m.end_date IS NULL OR m.end_date >= ?)
             """,
-            (iso_day, iso_day, iso_day),
+            (iso_day, current.weekday(), iso_day, iso_day),
         )).fetchall()
     for medicine_id, user_id, name, dose_number, frequency in unanswered:
         if user_id not in reminders_by_user:
@@ -427,7 +439,7 @@ async def month_statuses(user_id: int, year: int, month: int) -> dict[str, tuple
     last_day = date(year, month, calendar.monthrange(year, month)[1])
     async with aiosqlite.connect(DB_PATH) as db:
         medicines = await (await db.execute(
-            """SELECT id, start_date, end_date, frequency FROM medicines
+            """SELECT id, start_date, end_date, frequency, weekdays FROM medicines
                WHERE user_id = ? AND active = 1
                  AND (start_date IS NULL OR start_date <= ?)
                  AND (end_date IS NULL OR end_date >= ?)""",
@@ -445,8 +457,10 @@ async def month_statuses(user_id: int, year: int, month: int) -> dict[str, tuple
         iso_day = current.isoformat()
         active = [
             (medicine_id, frequency)
-            for medicine_id, start_raw, end_raw, frequency in medicines
-            if (not start_raw or start_raw <= iso_day) and (not end_raw or end_raw >= iso_day)
+            for medicine_id, start_raw, end_raw, frequency, weekdays in medicines
+            if (not start_raw or start_raw <= iso_day)
+            and (not end_raw or end_raw >= iso_day)
+            and current.weekday() in parse_weekdays(weekdays)
         ]
         total = sum(frequency for _, frequency in active)
         if total:
@@ -524,7 +538,7 @@ async def add_medicine(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(AddMedicine.name)
     await callback.message.edit_text(
-        "<b>Шаг 1 из 6. Название</b>\n\nВведите название препарата.",
+        "<b>Шаг 1 из 7. Название</b>\n\nВведите название препарата.",
         reply_markup=cancel_keyboard(),
     )
     await callback.answer()
@@ -533,6 +547,48 @@ async def add_medicine(callback: CallbackQuery, state: FSMContext) -> None:
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]
+    ])
+
+
+def serialize_weekdays(days: list[int] | tuple[int, ...] | set[int]) -> str:
+    return ",".join(str(day) for day in sorted(days))
+
+
+def parse_weekdays(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ALL_WEEKDAYS
+    return tuple(int(day) for day in value.split(","))
+
+
+def weekdays_text(days: list[int] | tuple[int, ...] | set[int]) -> str:
+    ordered = tuple(sorted(days))
+    if ordered == ALL_WEEKDAYS:
+        return "Каждый день"
+    return ", ".join(WEEKDAY_LABELS[day] for day in ordered)
+
+
+def weekdays_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Каждый день", callback_data="weekdays:all")],
+        [InlineKeyboardButton(text="Выбрать дни", callback_data="weekdays:custom")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
+    ])
+
+
+def custom_weekdays_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
+    day_buttons = [
+        InlineKeyboardButton(
+            text=f"{'✅ ' if day in selected else ''}{label}",
+            callback_data=f"weekday:{day}",
+        )
+        for day, label in enumerate(WEEKDAY_LABELS)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        day_buttons[:4],
+        day_buttons[4:],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="weekdays:done")],
+        [InlineKeyboardButton(text="← Назад", callback_data="weekdays:back")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
 
 
@@ -567,7 +623,7 @@ async def ask_start_date(target: Message | CallbackQuery, state: FSMContext) -> 
         [InlineKeyboardButton(text="Выбрать дату", callback_data="startdate:choose")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
-    text = "<b>Шаг 3 из 6. Дата начала</b>\n\nКогда начался или начнётся курс?"
+    text = "<b>Шаг 3 из 7. Дата начала</b>\n\nКогда начался или начнётся курс?"
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=keyboard)
         await target.answer()
@@ -581,7 +637,7 @@ async def choose_duration(callback: CallbackQuery, state: FSMContext) -> None:
     if parts[1] == "custom":
         await state.set_state(AddMedicine.custom_duration)
         await callback.message.edit_text(
-            "<b>Шаг 2 из 6. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>",
+            "<b>Шаг 2 из 7. Другой срок</b>\n\nВведите количество дней курса, например: <code>14</code>",
             reply_markup=cancel_keyboard(),
         )
         await callback.answer()
@@ -615,7 +671,7 @@ async def medicine_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=name)
     await state.set_state(AddMedicine.duration)
     await message.answer(
-        "<b>Шаг 2 из 6. Длительность курса</b>\n\nКак долго нужно принимать препарат?",
+        "<b>Шаг 2 из 7. Длительность курса</b>\n\nКак долго нужно принимать препарат?",
         reply_markup=duration_keyboard(),
     )
 
@@ -636,7 +692,7 @@ async def save_start_date(target: CallbackQuery, state: FSMContext, selected: da
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu")],
     ])
     await target.message.edit_text(
-        "<b>Шаг 4 из 6. Частота приёма</b>\n\nСколько раз в день нужно принимать препарат?",
+        "<b>Шаг 4 из 7. Частота приёма</b>\n\nСколько раз в день нужно принимать препарат?",
         reply_markup=keyboard,
     )
     await target.answer()
@@ -649,15 +705,76 @@ async def choose_frequency(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Некорректная частота", show_alert=True)
         return
     await state.update_data(frequency=frequency)
+    await state.set_state(AddMedicine.weekdays)
+    await callback.message.edit_text(
+        "<b>Шаг 5 из 7. В какие дни принимать препарат?</b>",
+        reply_markup=weekdays_choice_keyboard(),
+    )
+    await callback.answer()
+
+
+async def ask_note(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddMedicine.note)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Пропустить", callback_data="note:skip"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="menu"),
     ]])
     await callback.message.edit_text(
-        "<b>Шаг 5 из 6. Добавьте заметку о приёме препарата.</b>\n\n"
+        "<b>Шаг 6 из 7. Добавьте заметку о приёме препарата.</b>\n\n"
         "Например: 2 таблетки после еды",
         reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddMedicine.weekdays, F.data == "weekdays:all")
+async def choose_every_day(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(weekdays=list(ALL_WEEKDAYS))
+    await ask_note(callback, state)
+
+
+@router.callback_query(AddMedicine.weekdays, F.data == "weekdays:custom")
+async def choose_custom_weekdays(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = set(data.get("weekdays", []))
+    await state.update_data(weekdays=list(selected))
+    await callback.message.edit_text(
+        "<b>Шаг 5 из 7. Выберите дни приёма:</b>",
+        reply_markup=custom_weekdays_keyboard(selected),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddMedicine.weekdays, F.data.startswith("weekday:"))
+async def toggle_weekday(callback: CallbackQuery, state: FSMContext) -> None:
+    day = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    selected = set(data.get("weekdays", []))
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.add(day)
+    await state.update_data(weekdays=list(selected))
+    await callback.message.edit_reply_markup(
+        reply_markup=custom_weekdays_keyboard(selected)
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddMedicine.weekdays, F.data == "weekdays:done")
+async def confirm_weekdays(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("weekdays"):
+        await callback.answer("Выберите хотя бы один день.", show_alert=True)
+        return
+    await ask_note(callback, state)
+
+
+@router.callback_query(AddMedicine.weekdays, F.data == "weekdays:back")
+async def back_to_weekdays_choice(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "<b>Шаг 5 из 7. В какие дни принимать препарат?</b>",
+        reply_markup=weekdays_choice_keyboard(),
     )
     await callback.answer()
 
@@ -672,12 +789,13 @@ async def show_add_confirmation(
     note = data.get("note")
     note_text = f"\nЗаметка: {html.escape(note)}" if note else ""
     text = (
-        "<b>Шаг 6 из 6. Проверка</b>\n\n"
+        "<b>Шаг 7 из 7. Проверка</b>\n\n"
         f"Препарат: <b>{html.escape(data['name'])}</b>\n"
         f"Курс: {data['duration_label']}\n"
         f"Начало: {date.fromisoformat(data['start_date']).strftime('%d.%m.%Y')}\n"
         f"Последний день приёма: {end_text}\n"
-        f"Частота: {data['frequency']} раз(а) в день"
+        f"Частота: {data['frequency']} раз(а) в день\n"
+        f"Дни: {weekdays_text(data['weekdays'])}"
         f"{note_text}"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -743,7 +861,7 @@ async def start_today(callback: CallbackQuery, state: FSMContext) -> None:
 async def choose_start_date(callback: CallbackQuery) -> None:
     today = datetime.now(TIMEZONE).date()
     await callback.message.edit_text(
-        "<b>Шаг 3 из 6. Дата начала</b>\n\nВыберите день начала курса:",
+        "<b>Шаг 3 из 7. Дата начала</b>\n\nВыберите день начала курса:",
         reply_markup=start_calendar_markup(today.year, today.month),
     )
     await callback.answer()
@@ -782,11 +900,12 @@ async def save_medicine(callback: CallbackQuery, state: FSMContext) -> None:
         await db.execute(
             """INSERT INTO medicines(
                    user_id, name, start_date, end_date, frequency,
-                   duration_kind, duration_amount, note
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   duration_kind, duration_amount, note, weekdays
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 callback.from_user.id, data["name"], data["start_date"], data["end_date"],
                 data["frequency"], data["duration_kind"], data["duration_amount"], data.get("note"),
+                serialize_weekdays(data["weekdays"]),
             ),
         )
         await db.commit()
@@ -803,7 +922,7 @@ async def list_medicines(callback: CallbackQuery) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         rows = await (await db.execute(
             """
-            SELECT m.id, m.name, m.start_date, m.end_date, m.frequency, m.note
+            SELECT m.id, m.name, m.start_date, m.end_date, m.frequency, m.note, m.weekdays
             FROM medicines m
             WHERE m.user_id = ? AND m.active = 1
             ORDER BY m.name
@@ -811,9 +930,12 @@ async def list_medicines(callback: CallbackQuery) -> None:
             (callback.from_user.id,),
         )).fetchall()
     descriptions = []
-    for _, name, start_date, end_date, frequency, note in rows:
+    for _, name, start_date, end_date, frequency, note, weekdays in rows:
         course = "бессрочно" if not end_date else f"до {date.fromisoformat(end_date).strftime('%d.%m.%Y')}"
-        description = f"• <b>{html.escape(name)}</b>: {frequency} раз(а) в день; {course}"
+        description = (
+            f"• <b>{html.escape(name)}</b>: {frequency} раз(а) в день; "
+            f"{weekdays_text(parse_weekdays(weekdays))}; {course}"
+        )
         if note:
             preview = note if len(note) <= 80 else note[:77] + "..."
             description += f"\n  📝 {html.escape(preview)}"
@@ -831,7 +953,8 @@ async def list_medicines(callback: CallbackQuery) -> None:
 async def medicine_for_user(user_id: int, medicine_id: int) -> tuple | None:
     async with aiosqlite.connect(DB_PATH) as db:
         return await (await db.execute(
-            """SELECT id, name, start_date, end_date, frequency, duration_kind, duration_amount, note
+            """SELECT id, name, start_date, end_date, frequency,
+                      duration_kind, duration_amount, note, weekdays
                FROM medicines WHERE id = ? AND user_id = ? AND active = 1""",
             (medicine_id, user_id),
         )).fetchone()
@@ -842,7 +965,7 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
     if not medicine:
         await callback.answer("Препарат не найден", show_alert=True)
         return
-    _, name, start_raw, end_raw, frequency, _, _, note = medicine
+    _, name, start_raw, end_raw, frequency, _, _, note, weekdays = medicine
     start_text = date.fromisoformat(start_raw).strftime("%d.%m.%Y") if start_raw else "не указана"
     end_text = date.fromisoformat(end_raw).strftime("%d.%m.%Y") if end_raw else "не ограничен"
     await state.set_state(EditMedicine.menu)
@@ -851,6 +974,7 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
         [InlineKeyboardButton(text="Изменить длительность", callback_data="editfield:duration")],
         [InlineKeyboardButton(text="Изменить дату начала", callback_data="editfield:start")],
         [InlineKeyboardButton(text="Изменить частоту", callback_data="editfield:frequency")],
+        [InlineKeyboardButton(text="Изменить дни приёма", callback_data="editfield:weekdays")],
         [InlineKeyboardButton(text="Изменить заметку", callback_data="editfield:note")],
         [InlineKeyboardButton(text="🗑 Удалить препарат", callback_data=f"medicine:delete:{medicine_id}")],
         [InlineKeyboardButton(text="← Мои препараты", callback_data="medicine:list")],
@@ -860,6 +984,7 @@ async def render_edit_menu(callback: CallbackQuery, state: FSMContext, medicine_
         f"Дата начала: {start_text}\n"
         f"Последний день приёма: {end_text}\n"
         f"Частота: {frequency} раз(а) в день\n"
+        f"Дни: {weekdays_text(parse_weekdays(weekdays))}\n"
         f"Заметка: {html.escape(note) if note else 'не добавлена'}\n\n"
         "Что изменить?",
         reply_markup=keyboard,
@@ -953,6 +1078,122 @@ async def edit_frequency(callback: CallbackQuery) -> None:
     ])
     await callback.message.edit_text("Выберите новую частоту приёма:", reply_markup=keyboard)
     await callback.answer()
+
+
+def edit_custom_weekdays_keyboard(
+    selected: set[int],
+    medicine_id: int,
+) -> InlineKeyboardMarkup:
+    day_buttons = [
+        InlineKeyboardButton(
+            text=f"{'✅ ' if day in selected else ''}{label}",
+            callback_data=f"editweekday:{day}",
+        )
+        for day, label in enumerate(WEEKDAY_LABELS)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        day_buttons[:4],
+        day_buttons[4:],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="editweekdays:done")],
+        [InlineKeyboardButton(
+            text="← Назад",
+            callback_data=f"medicine:edit:{medicine_id}",
+        )],
+    ])
+
+
+@router.callback_query(EditMedicine.menu, F.data == "editfield:weekdays")
+async def edit_weekdays(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    medicine_id = data["edit_medicine_id"]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Каждый день", callback_data="editweekdays:all")],
+        [InlineKeyboardButton(text="Выбрать дни", callback_data="editweekdays:custom")],
+        [InlineKeyboardButton(
+            text="← Назад",
+            callback_data=f"medicine:edit:{medicine_id}",
+        )],
+    ])
+    await callback.message.edit_text(
+        "В какие дни принимать препарат?",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@router.callback_query(EditMedicine.menu, F.data == "editweekdays:all")
+async def edit_every_day(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE medicines SET weekdays=? WHERE id=? AND user_id=? AND active=1",
+            (
+                serialize_weekdays(ALL_WEEKDAYS),
+                data["edit_medicine_id"],
+                callback.from_user.id,
+            ),
+        )
+        await db.commit()
+    await render_edit_menu(callback, state, data["edit_medicine_id"])
+
+
+@router.callback_query(EditMedicine.menu, F.data == "editweekdays:custom")
+async def edit_custom_weekdays(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    medicine = await medicine_for_user(
+        callback.from_user.id, data["edit_medicine_id"]
+    )
+    if not medicine:
+        await callback.answer("Препарат не найден", show_alert=True)
+        return
+    selected = set(parse_weekdays(medicine[8]))
+    await state.update_data(edit_weekdays=list(selected))
+    await state.set_state(EditMedicine.weekdays)
+    await callback.message.edit_text(
+        "Выберите дни приёма:",
+        reply_markup=edit_custom_weekdays_keyboard(
+            selected, data["edit_medicine_id"]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(EditMedicine.weekdays, F.data.startswith("editweekday:"))
+async def toggle_edit_weekday(callback: CallbackQuery, state: FSMContext) -> None:
+    day = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    selected = set(data.get("edit_weekdays", []))
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.add(day)
+    await state.update_data(edit_weekdays=list(selected))
+    await callback.message.edit_reply_markup(
+        reply_markup=edit_custom_weekdays_keyboard(
+            selected, data["edit_medicine_id"]
+        )
+    )
+    await callback.answer()
+
+
+@router.callback_query(EditMedicine.weekdays, F.data == "editweekdays:done")
+async def save_edit_weekdays(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = data.get("edit_weekdays", [])
+    if not selected:
+        await callback.answer("Выберите хотя бы один день.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE medicines SET weekdays=? WHERE id=? AND user_id=? AND active=1",
+            (
+                serialize_weekdays(selected),
+                data["edit_medicine_id"],
+                callback.from_user.id,
+            ),
+        )
+        await db.commit()
+    await render_edit_menu(callback, state, data["edit_medicine_id"])
 
 
 @router.callback_query(EditMedicine.menu, F.data == "editfield:note")
@@ -1171,9 +1412,13 @@ async def toggle_intake(callback: CallbackQuery) -> None:
             """SELECT 1 FROM medicines m
                WHERE m.id=? AND m.user_id=? AND m.active=1
                  AND ? BETWEEN 1 AND m.frequency
+                 AND instr(',' || m.weekdays || ',', ',' || ? || ',') > 0
                  AND (m.start_date IS NULL OR m.start_date <= ?)
                  AND (m.end_date IS NULL OR m.end_date >= ?)""",
-            (medicine_id, callback.from_user.id, dose_number, iso_day, iso_day),
+            (
+                medicine_id, callback.from_user.id, dose_number,
+                date.fromisoformat(iso_day).weekday(), iso_day, iso_day,
+            ),
         )).fetchone()
         if not owned:
             await callback.answer("Приём не найден", show_alert=True)
@@ -1207,9 +1452,13 @@ async def reminder_medicine(
             """SELECT name, frequency FROM medicines
                WHERE id = ? AND user_id = ? AND active = 1 AND frequency IN (1, 2, 3)
                  AND ? BETWEEN 1 AND frequency
+                 AND instr(',' || weekdays || ',', ',' || ? || ',') > 0
                  AND (start_date IS NULL OR start_date <= ?)
                  AND (end_date IS NULL OR end_date >= ?)""",
-            (medicine_id, user_id, dose_number, iso_day, iso_day),
+            (
+                medicine_id, user_id, dose_number,
+                date.fromisoformat(iso_day).weekday(), iso_day, iso_day,
+            ),
         )).fetchone()
     return (row[0], row[1]) if row else None
 
